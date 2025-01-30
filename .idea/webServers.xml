@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="b6376f0f-f5da-4983-b121-1f7d81412dfd" name="NUS">
+        <fileTransfer accessType="SFTP" host="hopper.nus.edu.sg" port="22" sshConfigId="750f4ad4-cfa1-48d0-8efa-3dfbd5b464e8" sshConfig="e1143336@hopper.nus.edu.sg:22 key" keyPair="true">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="0" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>

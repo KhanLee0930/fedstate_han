@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="SshConfigs">
+    <configs>
+      <sshConfig host="hopper.nus.edu.sg" id="750f4ad4-cfa1-48d0-8efa-3dfbd5b464e8" keyPath="$USER_HOME$/.ssh/id_rsa" port="22" nameFormat="DESCRIPTIVE" username="e1143336" useOpenSSHConfig="true" />
+    </configs>
+  </component>
+</project>

@@ -1,0 +1,23 @@
+PROJECT_ROOT=/home/svu/e1143336/fedstate
+
+# AZURE_PROBLEM_DIR=/home/azureuser/cloudfiles/code/te_problems
+# ALL_PROBLEM_LIST=$(cd $AZURE_PROBLEM_DIR; ls)
+
+# INPUT_DIR=/data/projects/11003765/sate/input
+OUTPUT_DIR=${PROJECT_ROOT}/output
+SCRIPTS_DIR=${PROJECT_ROOT}/scripts
+
+# TEAL_SCRIPT=${PROJECT_ROOT}/run/teal.py
+# TEAL_LATENCY=${PROJECT_ROOT}/run/teal_latency.py
+# LP_SCRIPT=${PROJECT_ROOT}/run/lp.py
+# SPACETE_SCRIPT=${PROJECT_ROOT}/run/spaceTE.py
+# ECMP_SCRIPT=${PROJECT_ROOT}/run/ECMP.py
+# ECMP_REDUCED_SCRIPT=${PROJECT_ROOT}/run/ECMPReduced.py
+# TOPOLOGY_SCRIPT=${PROJECT_ROOT}/run/topology-embedding.py
+
+FEDSATE_SCRIPT=${PROJECT_ROOT}/src/main.py
+FEDSATE_SCRIPT=${PROJECT_ROOT}/src/main_fedprox.py
+
+IRIDIUM_ADAPTER_SCRIPT=${PROJECT_ROOT}/utils/iridium/adapter.py
+IRIDIUM_NEW_FORM_ADAPTER_SCRIPT=${PROJECT_ROOT}/utils/iridium/adapt_iridium.py
+STARLINK_ADAPTER_SCRIPT=${PROJECT_ROOT}/utils/starlink/adapt_starlink.py

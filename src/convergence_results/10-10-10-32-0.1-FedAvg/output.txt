@@ -1,0 +1,17 @@
+Namespace(B=32, E=10, N=10, alpha=0.1, delta=0.1, epsilon=0.01, method='FedAvg', num_rounds=1000, num_samples=50, p=10, spi=0.1, target_accuracy=1)
+Save Directory: data/10-10-10-32-0.1-FedAvg
+['Data Readout Finished!']
+Scheduler Starts
+tensor([[ 565,  365,    3,    3, 2918,   15,  172,  299,    0,    6],
+        [1639, 2787,  334, 3011,    0,    0, 3461,   58,    0,  393],
+        [   0,    0, 1924,    4,  610,    0,  226,  181,   21,    0],
+        [ 502,  836,    1,    0,    3,    0,    2,   49, 1321,  263],
+        [   0,    0,  268,    1,    0,    0,    0,    0,    0, 2897],
+        [   0,    0,    0,  766,    2,    0,  146,    0,    0,    0],
+        [  87,    6, 1105,    0,    0,   20,    0, 3375,    0,    0],
+        [   2,    0,  365,    0,    0,   22,    0,    0,    0,   31],
+        [  20,    1,    4,    0,  497, 3571,    0,    0,    3,    0],
+        [1141,    1,    1,  219,    3,  359,    1,   46, 2658,  406]],
+       device='cuda:0', dtype=torch.int32)
+Initial Loss: 6.692904666252434, L: 2.298360824584961, C1: 16.32069207757724, sigma_squared: 11087.537012047866, Lambda: 4.678845405578613, zeta: 0.0, lr: 0.008577496744692326, iteration estimation: 116584.140625, threshold: 2.0288772583007812
+[36m(ClientAppActor pid=329349)[0m Files already downloaded and verified

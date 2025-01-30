@@ -1,0 +1,18 @@
+Namespace(B=32, E=10, N=10, alpha=100.0, delta=0.1, epsilon=0.01, method='FedAvg', num_rounds=1000, num_samples=50, p=10, spi=0.1, target_accuracy=1)
+Save Directory: data/10-10-10-32-100.0-FedAvg
+['Data Readout Finished!']
+Scheduler Starts
+tensor([[415, 425, 455, 471, 415, 456, 384, 371, 388, 389],
+        [423, 439, 364, 428, 379, 357, 434, 346, 348, 451],
+        [323, 399, 374, 319, 398, 392, 381, 423, 474, 381],
+        [402, 356, 404, 382, 366, 422, 418, 445, 432, 404],
+        [405, 389, 448, 387, 355, 439, 409, 393, 432, 407],
+        [418, 435, 436, 439, 432, 371, 480, 451, 402, 344],
+        [388, 440, 417, 382, 432, 370, 378, 364, 370, 475],
+        [423, 389, 348, 345, 370, 415, 406, 384, 377, 381],
+        [402, 330, 389, 431, 418, 339, 370, 400, 360, 349],
+        [415, 352, 411, 415, 396, 410, 366, 394, 454, 434]], device='cuda:0',
+       dtype=torch.int32)
+Initial Loss: 7.328939967602492, L: 1.0819358825683594, C1: 19.768123989203715, sigma_squared: 8002.0627505954835, Lambda: 1.006860375404358, zeta: 0.0, lr: 0.039071667939424515, iteration estimation: 25593.9921875, threshold: 5.225486755371094
+[36m(ClientAppActor pid=364016)[0m Files already downloaded and verified
+[36m(ClientAppActor pid=364014)[0m Files already downloaded and verified[32m [repeated 9x across cluster][0m
