@@ -1,4 +1,4 @@
-PROJECT_ROOT=/home/svu/e1143336/fedstate
+PROJECT_ROOT=$(dirname $(readlink -f $0))/..
 
 # AZURE_PROBLEM_DIR=/home/azureuser/cloudfiles/code/te_problems
 # ALL_PROBLEM_LIST=$(cd $AZURE_PROBLEM_DIR; ls)
@@ -16,7 +16,6 @@ SCRIPTS_DIR=${PROJECT_ROOT}/scripts
 # TOPOLOGY_SCRIPT=${PROJECT_ROOT}/run/topology-embedding.py
 
 FEDSATE_SCRIPT=${PROJECT_ROOT}/src/main.py
-FEDSATE_SCRIPT=${PROJECT_ROOT}/src/main_fedprox.py
 
 IRIDIUM_ADAPTER_SCRIPT=${PROJECT_ROOT}/utils/iridium/adapter.py
 IRIDIUM_NEW_FORM_ADAPTER_SCRIPT=${PROJECT_ROOT}/utils/iridium/adapt_iridium.py

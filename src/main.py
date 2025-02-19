@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import copy
+import random
 import warnings
 import datasets.utils._dill
-
+warnings.filterwarnings("ignore", category=UserWarning)
 def suppress_dill_warnings():
     warnings.filterwarnings("ignore", category=DeprecationWarning, module="datasets.utils._dill")
 
@@ -17,7 +19,7 @@ import numpy as np
 
 from critic import Critic
 from actor import FedSateDataBalancer
-from utils.utils import parse_args, run_pre_experiments, Net, load_datasets, set_parameters, get_parameters, train, test
+from utils.utils import parse_args, run_pre_experiments, Net, load_datasets, set_parameters, get_parameters, train, test, set_seed, load_datasets_distribution
 import StarlinkDataForFL.StarlinkData as Generator
 
 import flwr
@@ -26,12 +28,22 @@ from flwr.server import ServerApp, ServerConfig, ServerAppComponents
 from flwr.server.strategy import FedAvg, FedAdagrad
 from flwr.simulation import run_simulation
 from flwr.common import ndarrays_to_parameters, NDArrays, Scalar, Context
+from huggingface_hub import HfApi
 
+import sys
+
+#token = "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"
+#os.environ["HUGGINGFACE_TOKEN"] = token
+#api = HfApi()
+#user_info = api.whoami(token=token)
+#print(user_info)
 
 class FlowerClient(NumPyClient):
-    def __init__(self, pid, net, local_iterations, lr, trainloader, valloader, device):
+    def __init__(self, pid, net, local_iterations, lr, trainloader, valloader, weight_decay, device):
         self.pid = pid  # partition ID of a client
         self.net = net
+        # We use simple SGD since that is what is specified in the paper. Also, Adam might cause divergence. Lastly, adding weight decay might prevent divergence
+        self.optimizer = torch.optim.SGD(net.parameters(), lr=lr, weight_decay=weight_decay)
         self.local_iterations = local_iterations
         self.lr = lr
         self.trainloader = trainloader
@@ -43,33 +55,25 @@ class FlowerClient(NumPyClient):
         return get_parameters(self.net)
 
     def fit(self, parameters, config):
-        # Read values from config
         set_parameters(self.net, parameters)
-        round_grad_norm_squared, loss, self.train_iter = train(self.net, self.train_iter, self.trainloader,
-                                                         local_iterations=self.local_iterations, lr=self.lr,
-                                                         device=self.device)
-        metrics = {"round_grad_norm_squared": json.dumps(round_grad_norm_squared), "train_loss": json.dumps(loss)}
+        round_grad_norm_squared, losses, self.train_iter = train(self.net, self.optimizer, self.train_iter, self.trainloader,
+                                                         local_iterations=self.local_iterations, device=self.device)
+        metrics = {"round_grad_norm_squared": json.dumps(round_grad_norm_squared), "train_losses": json.dumps(losses)}
         return get_parameters(self.net), len(self.trainloader), metrics
 
-    def evaluate(self, parameters, config):
-        set_parameters(self.net, parameters)
-        loss, accuracy = test(self.net, self.valloader, self.device)
-        return float(loss), len(self.valloader), {"accuracy": float(accuracy)}
 
-
-def client_fn_wrapper(save_dir: str, alpha: float, batch_size: int, local_iterations: int, lr: float, distribution, device):
+def client_fn_wrapper(save_dir: str, batch_size: int, local_iterations: int, lr: float, distribution, weight_decay, device):
     def client_fn(context: Context) -> Client:
         net = Net().to(device)
         partition_id = context.node_config["partition-id"]
-        num_partitions = context.node_config["num-partitions"]
-        trainloader, valloader, _, _ = load_datasets(save_dir, partition_id, num_partitions, batch_size, alpha=alpha, distribution=distribution)
-        return FlowerClient(partition_id, net, local_iterations, lr, trainloader, valloader, device).to_client()
+        trainloader, testloader, _ = load_datasets_distribution(save_dir, partition_id, batch_size, distribution)
+        return FlowerClient(partition_id, net, local_iterations, lr, trainloader, testloader, weight_decay, device).to_client()
 
     return client_fn
 
 
 def create_evaluate_fn(save_dir: str, batch_size: int, p, device):
-    _, _, testloader, _ = load_datasets(save_dir, 0, p, batch_size)
+    _, testloader, _ = load_datasets(save_dir, 0, p, batch_size)
     def evaluate(
         server_round: int,
         parameters: NDArrays,
@@ -82,7 +86,6 @@ def create_evaluate_fn(save_dir: str, batch_size: int, p, device):
 
     return evaluate
 
-
 def fit_config(server_round: int):
     """Return training configuration dict for each round.
 
@@ -94,59 +97,40 @@ def fit_config(server_round: int):
     }
     return config
 
-
-
 class CommunicationTrackingStrategy(FedAvg):
-    def __init__(self, save_dir, batch_size, num_rounds, target_accuracy, **kwargs):
+    def __init__(self, save_dir, batch_size, num_rounds, **kwargs):
         super().__init__(**kwargs)
         self.save_dir = save_dir
         self.batch_size = batch_size
         self.num_rounds = num_rounds
-        self.total_communication_cost = 0
-        self.target_accuracy = target_accuracy
         self.current_accuracy = 0.0
+
+        self.train_loss = []
         self.total_grad_norm_squared = []
         self.test_acc = []
-        self.train_loss = []
-        self.val_acc = []
 
     def evaluate(self, rnd, parameters):
         # Call the original evaluate function
         loss, metrics = super().evaluate(rnd, parameters)
         self.current_accuracy = metrics.get("accuracy", 0.0)
-        if self.current_accuracy >= self.target_accuracy:
-            print(f"Target accuracy reached: {self.current_accuracy}")
-            return None, metrics
         return loss, metrics
-
-    def stop_condition(self):
-        # Stop if the current accuracy meets or exceeds the target accuracy
-        return self.current_accuracy >= self.target_accuracy
 
     def aggregate_fit(self, rnd,
                       results: list[tuple[flwr.server.client_proxy.ClientProxy, flwr.common.FitRes]],
                       failures):
-        # calculate communication cost
-        communication_cost = 0
         avg_grad_norm_squared = []
-        train_loss = 0
+        train_loss = []
+        # Aggregate results from all clients
         for client_result in results:
             _, fit_res = client_result
-            # Convert parameters to ndarrays
-            weights = flwr.common.parameters_to_ndarrays(fit_res.parameters)
-            weights_size = sum(w.nbytes for w in weights)
-            communication_cost += weights_size
-            round_grad_norm_squared = json.loads(fit_res.metrics["round_grad_norm_squared"])
-            avg_grad_norm_squared.append(round_grad_norm_squared)
-            train_loss += json.loads(fit_res.metrics["train_loss"])
-        self.total_grad_norm_squared.extend(
-            [sum(grad_norm_squared[i] / len(avg_grad_norm_squared) for grad_norm_squared in avg_grad_norm_squared) for i
-             in range(len(avg_grad_norm_squared[0]))])
-        self.total_communication_cost += communication_cost
+            avg_grad_norm_squared.append(json.loads(fit_res.metrics["round_grad_norm_squared"]))
+            train_loss.append(json.loads(fit_res.metrics["train_losses"]))
+
+        # Average results over clients
+        self.total_grad_norm_squared.extend(np.mean(np.array(avg_grad_norm_squared), axis=0).tolist())
+        self.train_loss.extend(np.mean(np.array(train_loss), axis=0).tolist())
         self.test_acc.append(self.current_accuracy)
-        self.train_loss.append(train_loss/len(results))
-        # print(f"Round {rnd}: Total communication cost this round: {communication_cost / 1024} KB")
-        # print(f"Total communication cost so far: {self.total_communication_cost / 1024} KB")
+        # Save results at the end of training
         if rnd == self.num_rounds:
             cumulative_average = np.cumsum(np.array(self.total_grad_norm_squared)) / np.arange(1,
                                                                                                len(self.total_grad_norm_squared) + 1)
@@ -156,34 +140,23 @@ class CommunicationTrackingStrategy(FedAvg):
         # Call the original aggregate_fit method
         return super().aggregate_fit(rnd, results, failures)
 
-    def aggregate_evaluate(self, server_round: int, results: List[Tuple[float, dict]], failures: List[BaseException]) -> Optional[float]:
-        val_acc = 0
-        total_examples = 0
-        for _, evaluate_res in results:
-            total_examples += evaluate_res.num_examples
-            val_acc += evaluate_res.metrics["accuracy"] * evaluate_res.num_examples
-        self.val_acc.append(val_acc/total_examples)
-        if server_round == self.num_rounds:
-            np.save(os.path.join(self.save_dir, "val_acc.npy"), np.array(self.val_acc))
-        return super().aggregate_evaluate(server_round, results, failures)
 
 # save_dir, batch_size, target_accuracy, **kwargs
-def server_fn_wrapper(save_dir, batch_size, num_rounds, target_accuracy, p, params, device):
+def server_fn_wrapper(save_dir, batch_size, num_rounds, p, params, device):
     def server_fn(context: Context) -> ServerAppComponents:
         # Create the FedAvg strategy
         strategy = CommunicationTrackingStrategy(
             save_dir=save_dir,
             batch_size=batch_size,
             num_rounds=num_rounds,
-            target_accuracy=target_accuracy,
             fraction_fit=1,
             fraction_evaluate=1,
             min_fit_clients=1,
             min_evaluate_clients=1,
             min_available_clients=p,
             initial_parameters=ndarrays_to_parameters(params),
-            evaluate_fn=create_evaluate_fn(save_dir, batch_size, p, device),  # Pass the evaluation function
-            on_fit_config_fn=fit_config,  # Pass the fit configuration function
+            evaluate_fn=create_evaluate_fn(save_dir, batch_size, p, device),
+            on_fit_config_fn=fit_config
         )
 
         # Configure the server for 10 rounds of training
@@ -194,66 +167,64 @@ def server_fn_wrapper(save_dir, batch_size, num_rounds, target_accuracy, p, para
 
 
 if __name__ == "__main__":
-    np.random.seed(42)
     args = parse_args()
-    save_dir = args.save_dir
+
+    # Set random seed for numpy, torch, random, to ensure reproducibility
+    set_seed(args.seed)
+
+    # Define save directory, which is for the dataset, such that each experimental setup has its own directory to prevent overwriting
+    save_dir = os.path.join(args.save_dir, f"{args.N}-{args.p}-{args.E}-{args.alpha}-{args.B}", f"{args.method}-{args.balance_params}-{args.seed}")
+    os.makedirs(save_dir, exist_ok=True)
     print(f"Save Directory: {save_dir}")
 
-    # Initialize Parameters
+    # Initialize Device, Model, Criterion
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     initial_model = Net().to(device)
-    criterion = torch.nn.CrossEntropyLoss()
     params = get_parameters(initial_model)
+    criterion = torch.nn.CrossEntropyLoss()
     if device.type == "cuda":
         backend_config = {"client_resources": {"num_cpus": 1, "num_gpus": 1 / args.p}}
     else:
         backend_config = {"client_resources": {"num_cpus": 1, "num_gpus": 0.0}}
 
+    # Lightweight Experiments, assuming we run it on IID dataset (alpha=-1)
+    configs, num_classes, model_size, spi_predictor = run_pre_experiments(args.N, args.B, args.num_samples, copy.deepcopy(initial_model), criterion, save_dir, device)
+    print("Lightweight Experiments Output:")
+    print(f"L: {configs[0]}, C1: {configs[1]}, sigmasquared: {configs[2]}, Loss: {configs[3]}, Zeta: {configs[4]}, SPI: {spi_predictor.predict(torch.tensor(args.B))}, Model Size: {model_size}")
 
-    # Lightweight Experiments
-    configs, zeta, num_classes = run_pre_experiments(args.N, args.B, args.alpha, args.num_samples, initial_model, criterion,
-                                        save_dir, device)
-    print("Lightweight Experiments")
-    print(configs,zeta,num_classes)
-    print("Lightweight Experiments")
+    # Satellite Connectivity Data
+    data, initial_distribution = Generator.Model_Generator(args.N, args.alpha, save_dir)
+    print("Output for Satellite Connectivity Data")
+    print(f"Average visible satellites by each user: {np.mean(np.sum(data['Psi'], axis=1))}, "
+          f"Average number of satellites between two satellites: {np.mean(np.sum(data['Phi'], axis=1))}, "
+          f"Uploading speed: {np.mean(data['C_access'])}, Transmission speed: {np.mean(data['C_e'])}, "
+          f"Number of users: {data['N']}, Number of classes: {num_classes}, Number of clients: {args.p}, "
+          f"Number of satellites: {data['S']}, Average visible satellites by each satellite: {np.mean(np.sum(data['G'], axis=1))}")
 
-    # Critic
-    critic = Critic(configs, zeta, args.E, args.epsilon, args.B, args.p, args.spi, device)
+    # Define Actor
+    actor = FedSateDataBalancer(initial_distribution, data['Psi'], data['Phi'], args.delta, data['C_access'], data['C_e'], data['N'], num_classes, args.p, data['S'], data['S_set'], data['E_involved'], num_epochs=args.num_actor_rounds, model_size=model_size, device=device)
 
-    # Satellite connectivity data
-    data = Generator.Model_Generator(args.N, num_classes, critic.distribution.detach().cpu().numpy(), args.delta, args.p)
-    Para = [data['N'], num_classes, data['K'], data['S']]
+    # Define Critic
+    critic = Critic(configs, args.E, args.epsilon, args.B, args.p, spi_predictor, actor.communication_time)
+
     print('Scheduler Starts')
-
-    print("critic.distribution")
-    print(critic.distribution)
-    print("critic.distribution")
-
-    actor = FedSateDataBalancer(critic.distribution, data['Psi'], data['Phi'], args.delta, data['C_access'], data['C_e'], Para, data['S_set'], data['E_involved'], data['Client_Set'], num_epochs=200001)
-    if args.method == "Balance":
-        _, distribution, _ = actor.balance_critic(critic)
-    elif args.method == "IID":
-        _, distribution, _ = actor.balance_iid()
-    elif args.method == "Non-IID":
-        _, distribution, _ = actor.balance_non_iid()
-    elif args.method == "Random":
-        _, distribution, _ = actor.balance_vanilla_uploading()
+    _, distribution, _, batch_size, E = actor.uploading_strategy(args.method, critic, args.balance_params, args.B, args.E)
 
     distribution = torch.floor(distribution).to(torch.int)
-    print(args.method, distribution)
-    # Obtain learning rate
+    print(f"Final distribution obtained for {args.method}: {distribution}")
+    print(f"Predict initial lambda: {critic.get_gradient_diversity(initial_distribution.to(device))}, predicted final lambda: {critic.get_gradient_diversity(distribution.to(device))}")
+    # Using the final distribution, we obtain the parameters of the training
     Lambda = critic.get_gradient_diversity(distribution)
-    lr = critic.get_lr(Lambda)
-    threshold = critic.get_threshold(lr)
-    iteration_estimation, time_estimation = critic.time_estimation(distribution)
-    print(
-        f"Initial Loss: {critic.initial_loss}, L: {critic.L}, C1: {critic.C1}, sigma_squared: {critic.sigma_squared}, Lambda: {Lambda}, zeta: {zeta}, lr: {lr}, iteration estimation: {iteration_estimation}, threshold: {threshold}")
-    convergence_prediction = critic.get_convergence_prediction(lr, args.num_rounds * args.E)
-    np.save(os.path.join(save_dir, "predicted_GNS.npy"), convergence_prediction)
+    lr = critic.get_lr(Lambda,batch_size, E)
+
+    # Save the estimation obtained by the critic
+    GNS_prediction = critic.get_GNS_prediction(lr, args.num_rounds * args.E)
+    np.save(os.path.join(save_dir, "GNS_prediction.npy"), GNS_prediction)
+
     # Create the Client/ServerApp
-    client = ClientApp(client_fn=client_fn_wrapper(save_dir, args.alpha, args.B, args.E, lr, distribution, device))
+    client = ClientApp(client_fn=client_fn_wrapper(save_dir, batch_size, E, lr, distribution, args.weight_decay, device))
     server = ServerApp(
-        server_fn=server_fn_wrapper(save_dir, args.B, args.num_rounds, args.target_accuracy, args.p, params, device))
+        server_fn=server_fn_wrapper(save_dir, batch_size, args.num_rounds, args.p, params, device))
 
     # Run Simulation
     run_simulation(

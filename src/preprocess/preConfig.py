@@ -3,6 +3,20 @@ import numpy as np
 from tqdm import tqdm
 import statsmodels.api as sm
 import random
+import copy
+import time
+from torch.utils.data import DataLoader
+
+class SPI:
+    def __init__(self, degree):
+        self.degree = degree
+    def fit(self, x, y):
+        self.coefficients = np.polyfit(np.log(np.array(x)), np.log(np.array(y)), self.degree)
+        self.coefficients = [torch.tensor(c, dtype=torch.float32, requires_grad=False) for c in self.coefficients]
+    def predict(self, x):
+        x = torch.log(x)
+        pred = sum(c * x**i for i, c in enumerate(reversed(self.coefficients)))
+        return torch.exp(pred)
 
 class PreConfig(object):
 
@@ -122,6 +136,8 @@ class PreConfig(object):
         batch_variances = np.array(batch_variances)
         grad_norm_squares = np.array(grad_norm_squares)
         grad_norm_squares = sm.add_constant(grad_norm_squares)
+        # print("batch_variances shape:", batch_variances.shape)
+        # print("grad_norm_squares shape:", grad_norm_squares.shape)
         model = sm.QuantReg(batch_variances, grad_norm_squares)
         result = model.fit(q=0.95)
         sigma_squared_over_B, C1 = result.params
@@ -172,3 +188,26 @@ class PreConfig(object):
                                             else torch.zeros_like(gradients) for cls in range(self.num_classes)]) # (num_classes, d)
         self.class_counts = torch.tensor([class_counts[cls] for cls in range(self.num_classes)]) # (num_classes)
         return self.average_gradients, self.class_counts
+
+
+    def get_spi(self, model):
+        num_samples = 10
+        batch_sizes = [2, 4, 8, 16, 32, 64, 128, 256]
+        spi = []
+        for batch_size in batch_sizes:
+            train_loader = DataLoader(self.train_loader.dataset, batch_size=batch_size)
+            start = time.time()
+            for idx, batch in enumerate(train_loader):
+                if idx == num_samples:
+                    break
+                # Simulate forward and backwards passes
+                inputs, targets = batch["img"].to(self.device), batch["label"].to(self.device)
+                outputs = model(inputs)
+                loss = self.criterion(outputs, targets)
+                loss.backward()
+                model.zero_grad()
+            seconds_per_iteration = (time.time() - start)/num_samples
+            spi.append(seconds_per_iteration)
+        spi_predictor = SPI(degree=3)
+        spi_predictor.fit(batch_sizes, spi)
+        return spi_predictor

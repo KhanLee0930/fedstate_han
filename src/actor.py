@@ -7,7 +7,6 @@ import itertools
 import copy
 import time
 import torch
-from critic import TrainingCritic
 
 # torch.autograd.set_detect_anomaly(True)
 
@@ -37,33 +36,24 @@ S: Number of Satellites Involved in Data Move
 
 class FedSateDataBalancer:
 
-    def __init__(self, D, Psi, Phi, delta, C_access, C_e, Para, S_set, E_involved, Client_Set, num_epochs, device='cuda'):
+    def __init__(self, D, Psi, Phi, delta, C_access, C_e, N, M, K, S, S_set, E_involved, num_epochs, model_size, device='cuda'):
         # ============ Initialization ==============
-        [N, M, K, S] = Para
-
         # Ensure inputs are PyTorch tensors
         D = torch.tensor(D, dtype=torch.float32).to(device)          # N x M
         Psi = torch.tensor(Psi, dtype=torch.float32).to(device)      # N x S
-        Phi = torch.tensor(Phi, dtype=torch.float32).to(device)      # (S*K) x E
+        Phi = torch.tensor(Phi, dtype=torch.float32).to(device)      # (S*S) x E
         C_access = torch.tensor(C_access, dtype=torch.float32).to(device)  # N x S
-        C_e = torch.tensor(C_e, dtype=torch.float32).to(device)
+        E = Phi.size()[-1]
+        C_e_values = torch.arange(0.1, C_e + 1e-6, 0.1, device=device)
+        C_e = C_e_values[torch.randint(0, len(C_e_values), (E,))]
         S_set = torch.tensor(S_set).to(device)
         E_involved = torch.tensor(E_involved).to(device)
-        Client_Set = torch.tensor(Client_Set).to(device)
-
-        # # Pre Processing: Phi -> e2k and k2e
-        # e2k = []
-        # for e in range(Phi.shape[1]):  # Number of edges E
-        #     k1_list = torch.where(Phi[:, e] == 1)[0].tolist()
-        #     e2k.append(k1_list)
-
-        # k2e = []
-        # for k1 in range(Phi.shape[0]):  # Number of paths S*K
-        #     e_list = torch.where(Phi[k1, :] == 1)[0].tolist()
-        #     k2e.append(e_list)
 
         Phi = Phi.view(S, S, -1)  # S x S x E
-        Phi = Phi[:, :K, :] # S x K x E
+        random_indices = torch.randperm(S)[:K].to(device)  # Randomly select K indices to be client
+        communication_load = torch.sum(Phi[random_indices][:, random_indices, :], dim=(0, 1))
+        self.communication_time = torch.max(communication_load * model_size / C_e)
+        Phi = Phi[:, random_indices, :] # S x K x E
 
 
         self.N = N
@@ -78,7 +68,6 @@ class FedSateDataBalancer:
         self.C_e = C_e
         self.S_set = S_set
         self.E_involved = E_involved
-        self.Client_Set = Client_Set
         self.num_epochs = num_epochs
         self.device = device
 
@@ -91,7 +80,7 @@ class FedSateDataBalancer:
         data_upload_violation = torch.sum(scaled_x, dim=1) - self.D
 
         return D_sm, data_upload_violation # (S, M)
-    
+
     def moved_data(self, D_sm, y_k, y_s):
         D_km = torch.zeros(self.K, self.M, dtype=torch.float32)
         y = torch.cat((y_k, y_s), dim=0)
@@ -117,7 +106,7 @@ class FedSateDataBalancer:
         data_moving_violation = D_sm_new[self.K:, :]  # (S-K) x M
 
         return D_km, data_moving_violation
-    
+
     # ----------- t_collect --------------
     def collecting_time(self, x):
         softmax_x = torch.softmax(x, dim=1)
@@ -138,7 +127,7 @@ class FedSateDataBalancer:
     def moving_time(self, D_sm, y_k, y_s):
         y = torch.cat((y_k, y_s), dim=0)  # S x K x M
         softmax_y = torch.softmax(y, dim=1)
-        y = softmax_y * D_sm.unsqueeze(1).expand(-1, self.K, -1) 
+        y = softmax_y * D_sm.unsqueeze(1).expand(-1, self.K, -1)
 
         # Calculate the link load with y (S, K, M) and Phi (S, K, E), there should only be movement from S to K. The link load should be (E,)
         total_flow = y.sum(dim=2)
@@ -155,9 +144,7 @@ class FedSateDataBalancer:
 
         return t_move
 
-    def balance_critic(self, critic):
-
-        N = self.N
+    def uploading_strategy(self, method, critic, balance_params, B, E):
         M = self.M
         K = self.K
         S = self.S
@@ -166,54 +153,50 @@ class FedSateDataBalancer:
         num_epochs = self.num_epochs
         device = self.device
 
-
         # ------------- x (to optimize) ---------------
         # Compute the number of visible satellites per user
         Visible_Sat = torch.sum(Psi, dim=1, keepdim=True)  # N x 1
         # Avoid division by zero
         Visible_Sat_nonzero = Visible_Sat.clone()
         Visible_Sat_nonzero[Visible_Sat_nonzero == 0] = 1
-
         # Compute D divided by the number of visible satellites
         D_div_Visible = D / Visible_Sat_nonzero  # N x M
-
         # Expand D_div_Visible to match the dimensions
         D_div_Visible_expanded = D_div_Visible.unsqueeze(1).expand(-1, S, -1)  # N x S x M
-
         # Compute x using Psi as a mask
         x = D_div_Visible_expanded * Psi.unsqueeze(2)  # N x S x M
-
+        # Uploading strategy for each of the N users to each of the S satellites, for each class M
+        # The initialization is such that each user uniformly uploads their dataset to all visible satellites
         x = torch.nn.Parameter(x.to(device))
 
-        
         # ------------- y (to optimize) -------------------
         # Initialize y as zeros
+        # Satellities are split into two, the S-K group that are not involved in training, and the K group that are involved in training
+        # y_k defines the movement of data from the S-K satellites to the K satellites
         y_k = torch.nn.Parameter(torch.ones(S-K, K, M, dtype=torch.float32, device=device))
+        # y_s defines the movement of data within the K satellites
         y_s = torch.nn.Parameter(torch.ones(K, K, M, dtype=torch.float32, device=device))    # Wrap it as a Parameter
+
+        # ------------- batch_size, E (to optimize) -------------------
+        batch_size = torch.nn.Parameter(torch.tensor([B], dtype=torch.float32, device=device))
+        E = torch.nn.Parameter(torch.tensor([E], dtype=torch.float32, device=device))
+        # If we are additionally balancing the batch size and number of local epochs, simply pass it to the optimizer
+        if balance_params:
+            optimizer = torch.optim.Adam([x, y_k, y_s, batch_size, E], lr=1e-2)
+        else:
+            optimizer = torch.optim.Adam([x, y_k, y_s], lr=1e-2)
 
         # ------------ D_optimal --------------
         # # Compute the total number of samples for each label m
-        # total_D_m = torch.sum(D_sm, dim=0)  # M
-
-        # # Distribute samples equally among K satellites
-        # # For integer counts, use floor division and handle remainders
-        # samples_per_satellite = total_D_m // K  # M
-        # remainder = total_D_m % K  # M
-
-        # # Initialize D_optimal with samples_per_satellite
-        # D_optimal = samples_per_satellite.unsqueeze(0).expand(K, -1).clone()  # K x M
-
-        # # Distribute the remainder among the first 'remainder' satellites
-        # for i in range(K):
-        #     D_optimal[i] += (remainder > i).int()
+        total_D_m = torch.sum(D, dim=0)  # M
+        # Distribute samples equally among K satellites
+        # For integer counts, use floor division and handle remainders
+        samples_per_satellite = total_D_m // K  # M
+        # Initialize D_optimal with samples_per_satellite
+        D_optimal = samples_per_satellite.unsqueeze(0).expand(K, -1).clone()  # K x M
 
         # ------------ t_train ---------------
         # t_train, grad_t_train = critic(D, D_optimal)
-
-        optimizer = torch.optim.Adam([x, y_k, y_s], lr=1e-3)
-
-        rho = 10
-
         # ['Total Time', 'Collect', 'Move', 'Train']
         f_trajectory = []
 
@@ -222,298 +205,38 @@ class FedSateDataBalancer:
 
             D_sm, data_upload_violation = self.uploaded_data(x)
             D_km, data_moving_violation = self.moved_data(D_sm, y_k, y_s)
-            # upload_violation = torch.abs(data_upload_violation.sum())
-            # moving_violation = torch.abs(data_moving_violation.sum())
-
+            #upload_violation = torch.abs(data_upload_violation.sum())
+            #moving_violation = torch.abs(data_moving_violation.sum())
             t_collect = self.collecting_time(x)
             t_move = self.moving_time(D_sm, y_k, y_s)
+            _, t_train, Lambda, lr = critic.time_estimation(D_km, batch_size, E)
+            total_time = t_collect + t_move + t_train
+            iid_penalty = torch.sum(torch.abs(D_km - D_optimal))
 
-            # training time proxy from theory
-            _, t_train = critic.time_estimation(D_km)
-
-            # Compute the loss
-            loss = t_train + t_collect + t_move
-            total_time = loss
+            # Balance method minimizes the total time take
+            if method == "Balance":
+                loss = total_time
+            # IID method minimizes the the time taken to upload and move the data, with the constraint of IID
+            elif method == "IID":
+                loss = t_collect + t_move + iid_penalty * 10
+            # Non-IID just seeks to get the data to the clients as fast as possible
+            elif method == "Non-IID":
+                loss = t_collect + t_move
 
             # Save the trajectory
-            f_trajectory.append([total_time.item(), t_collect.item(), t_move.item()])
+            f_trajectory.append([total_time.detach().item(), t_collect.detach().item(), t_move.detach().item(), t_train.detach().item()])
 
             loss.backward()
             optimizer.step()
             with torch.no_grad():
                 x.mul_(Psi.unsqueeze(2))  # N x S x M
+                E.clamp_(1, 1000000)
+                batch_size.clamp(1, 1000000)
             if i % 10000 == 0:
-                print(f'Epoch {i}, Total Time: {total_time.item()}, Collect: {t_collect.item()}, Move: {t_move.item()}, Train: {t_train.item()}')
+                print(f"Batch Size: {batch_size.item()}, Local Epochs: {E.item()}")
+                print(f'Epoch {i}, Total Time: {total_time.item()}, Collect: {t_collect.item()}, Move: {t_move.item()}, Train: {t_train.item()}, Gradient Diversity: {Lambda}, Learning Rate: {lr.detach().item()}')
+                print(f"Distribution: {D_km}")
+
         D_sm, _ = self.uploaded_data(x)
         D_optimal, _ = self.moved_data(D_sm, y_k, y_s)
-        return f_trajectory, D_optimal, D_sm
-    
-    def balance_iid(self):
-
-        N = self.N
-        M = self.M
-        K = self.K
-        S = self.S
-        D = self.D
-        Psi = self.Psi
-        num_epochs = self.num_epochs
-        device = self.device
-
-
-        # ------------- x (to optimize) ---------------
-        # Compute the number of visible satellites per user
-        Visible_Sat = torch.sum(Psi, dim=1, keepdim=True)  # N x 1
-        # Avoid division by zero
-        Visible_Sat_nonzero = Visible_Sat.clone()
-        Visible_Sat_nonzero[Visible_Sat_nonzero == 0] = 1
-
-        # Compute D divided by the number of visible satellites
-        D_div_Visible = D / Visible_Sat_nonzero  # N x M
-
-        # Expand D_div_Visible to match the dimensions
-        D_div_Visible_expanded = D_div_Visible.unsqueeze(1).expand(-1, S, -1)  # N x S x M
-
-        # Compute x using Psi as a mask
-        x = D_div_Visible_expanded * Psi.unsqueeze(2)  # N x S x M
-
-        x = torch.nn.Parameter(x.to(device))
-
-        
-        # ------------- y (to optimize) -------------------
-        # Initialize y as zeros
-        y_k = torch.nn.Parameter(torch.ones(S-K, K, M, dtype=torch.float32, device=device))
-        y_s = torch.nn.Parameter(torch.ones(K, K, M, dtype=torch.float32, device=device))    # Wrap it as a Parameter
-
-        # ------------ D_optimal --------------
-        # # Compute the total number of samples for each label m
-        total_D_m = torch.sum(D, dim=0)  # M
-
-        # Distribute samples equally among K satellites
-        # For integer counts, use floor division and handle remainders
-        samples_per_satellite = total_D_m // K  # M
-        remainder = total_D_m % K  # M
-
-        # Initialize D_optimal with samples_per_satellite
-        D_optimal = samples_per_satellite.unsqueeze(0).expand(K, -1).clone()  # K x M
-
-        # Distribute the remainder among the first 'remainder' satellites
-        for i in range(K):
-            D_optimal[i] += (remainder > i).int()
-
-        # ------------ t_train ---------------
-        # t_train, grad_t_train = critic(D, D_optimal)
-
-        optimizer = torch.optim.Adam([x, y_k, y_s], lr=1e-3)
-
-        rho = 10
-
-        # ['Total Time', 'Collect', 'Move']
-        f_trajectory = []
-
-        for i in range(num_epochs):
-            optimizer.zero_grad()
-
-            D_sm, data_upload_violation = self.uploaded_data(x)
-            D_km, data_moving_violation = self.moved_data(D_sm, y_k, y_s)
-            # upload_violation = torch.abs(data_upload_violation.sum())
-            # moving_violation = torch.abs(data_moving_violation.sum())
-
-            t_collect = self.collecting_time(x)
-            t_move = self.moving_time(D_sm, y_k, y_s)
-            iid_panelty = torch.sum(torch.abs(D_km - D_optimal))
-
-            # Compute the loss
-            loss = t_collect + t_move + rho * iid_panelty
-            total_time = t_collect + t_move
-
-            # Save the trajectory
-            f_trajectory.append([total_time.item(), t_collect.item(), t_move.item()])
-
-            loss.backward()
-            optimizer.step()
-            with torch.no_grad():
-                x.mul_(Psi.unsqueeze(2))  # N x S x M
-            if i % 10000 == 0:
-                print(f'Epoch {i}, Total Uploading & Transmission Time: {total_time.item()}, Collect: {t_collect.item()}, Move: {t_move.item()}')
-        D_sm, _ = self.uploaded_data(x)
-        D_optimal, _ = self.moved_data(D_sm, y_k, y_s)
-        return f_trajectory, D_optimal, D_sm
-
-    def balance_non_iid(self):
-        
-        N = self.N
-        M = self.M
-        K = self.K
-        S = self.S
-        D = self.D
-        Psi = self.Psi
-        num_epochs = self.num_epochs
-        device = self.device
-
-
-        # ------------- x (to optimize) ---------------
-        # Compute the number of visible satellites per user
-        Visible_Sat = torch.sum(Psi, dim=1, keepdim=True)  # N x 1
-        # Avoid division by zero
-        Visible_Sat_nonzero = Visible_Sat.clone()
-        Visible_Sat_nonzero[Visible_Sat_nonzero == 0] = 1
-
-        # Compute D divided by the number of visible satellites
-        D_div_Visible = D / Visible_Sat_nonzero  # N x M
-
-        # Expand D_div_Visible to match the dimensions
-        D_div_Visible_expanded = D_div_Visible.unsqueeze(1).expand(-1, S, -1)  # N x S x M
-
-        # Compute x using Psi as a mask
-        x = D_div_Visible_expanded * Psi.unsqueeze(2)  # N x S x M
-
-        x = torch.nn.Parameter(x.to(device))
-
-        
-        # ------------- y (to optimize) -------------------
-        # Initialize y as zeros
-        y_k = torch.nn.Parameter(torch.ones(S-K, K, M, dtype=torch.float32, device=device))
-        y_s = torch.nn.Parameter(torch.ones(K, K, M, dtype=torch.float32, device=device))    # Wrap it as a Parameter
-
-        # ------------ D_optimal --------------
-        # # Compute the total number of samples for each label m
-        # total_D_m = torch.sum(D_sm, dim=0)  # M
-
-        # # Distribute samples equally among K satellites
-        # # For integer counts, use floor division and handle remainders
-        # samples_per_satellite = total_D_m // K  # M
-        # remainder = total_D_m % K  # M
-
-        # # Initialize D_optimal with samples_per_satellite
-        # D_optimal = samples_per_satellite.unsqueeze(0).expand(K, -1).clone()  # K x M
-
-        # # Distribute the remainder among the first 'remainder' satellites
-        # for i in range(K):
-        #     D_optimal[i] += (remainder > i).int()
-
-        # ------------ t_train ---------------
-        # t_train, grad_t_train = critic(D, D_optimal)
-
-        optimizer = torch.optim.Adam([x, y_k, y_s], lr=1e-3)
-
-        rho = 10
-
-        # ['Total Time', 'Collect', 'Move']
-        f_trajectory = []
-
-        for i in range(num_epochs):
-            optimizer.zero_grad()
-
-            D_sm, data_upload_violation = self.uploaded_data(x)
-            D_km, data_moving_violation = self.moved_data(D_sm, y_k, y_s)
-            # upload_violation = torch.abs(data_upload_violation.sum())
-            # moving_violation = torch.abs(data_moving_violation.sum())
-
-            t_collect = self.collecting_time(x)
-            t_move = self.moving_time(D_sm, y_k, y_s)
-
-            # Compute the loss
-            loss = t_collect + t_move
-            total_time = t_collect + t_move
-
-            # Save the trajectory
-            f_trajectory.append([total_time.item(), t_collect.item(), t_move.item()])
-
-            loss.backward()
-            optimizer.step()
-            with torch.no_grad():
-                x.mul_(Psi.unsqueeze(2))  # N x S x M
-            if i % 10000 == 0:
-                print(f'Epoch {i}, Total Uploading & Transmission Time: {total_time.item()}, Collect: {t_collect.item()}, Move: {t_move.item()}')
-        D_sm, _ = self.uploaded_data(x)
-        D_optimal, _ = self.moved_data(D_sm, y_k, y_s)
-        return f_trajectory, D_optimal, D_sm
-
-    def balance_vanilla_uploading(self):
-
-        N = self.N
-        M = self.M
-        K = self.K
-        S = self.S
-        D = self.D
-        Psi = self.Psi
-        num_epochs = self.num_epochs
-        device = self.device
-
-
-        # ------------- x ---------------
-        # Compute the number of visible satellites per user
-        Visible_Sat = torch.sum(Psi, dim=1, keepdim=True)  # N x 1
-        # Avoid division by zero
-        Visible_Sat_nonzero = Visible_Sat.clone()
-        Visible_Sat_nonzero[Visible_Sat_nonzero == 0] = 1
-
-        # Compute D divided by the number of visible satellites
-        D_div_Visible = D / Visible_Sat_nonzero  # N x M
-
-        # Expand D_div_Visible to match the dimensions
-        D_div_Visible_expanded = D_div_Visible.unsqueeze(1).expand(-1, S, -1)  # N x S x M
-
-        # Compute x using Psi as a mask
-        x = D_div_Visible_expanded * Psi.unsqueeze(2)  # N x S x M
-
-        x = x.to(device)
-        
-        # ------------- y (to optimize) -------------------
-        # Initialize y as zeros
-        y_k = torch.nn.Parameter(torch.ones(S-K, K, M, dtype=torch.float32, device=device))
-        y_s = torch.nn.Parameter(torch.ones(K, K, M, dtype=torch.float32, device=device))    # Wrap it as a Parameter
-
-        # ------------ D_optimal --------------
-        # # Compute the total number of samples for each label m
-        # total_D_m = torch.sum(D_sm, dim=0)  # M
-
-        # # Distribute samples equally among K satellites
-        # # For integer counts, use floor division and handle remainders
-        # samples_per_satellite = total_D_m // K  # M
-        # remainder = total_D_m % K  # M
-
-        # # Initialize D_optimal with samples_per_satellite
-        # D_optimal = samples_per_satellite.unsqueeze(0).expand(K, -1).clone()  # K x M
-
-        # # Distribute the remainder among the first 'remainder' satellites
-        # for i in range(K):
-        #     D_optimal[i] += (remainder > i).int()
-
-        # ------------ t_train ---------------
-        # t_train, grad_t_train = critic(D, D_optimal)
-
-        optimizer = torch.optim.Adam([y_k, y_s], lr=1e-3)
-
-        rho = 10
-
-        # ['Total Time', 'Collect', 'Move']
-        f_trajectory = []
-
-        for i in range(num_epochs):
-            optimizer.zero_grad()
-
-            D_sm, data_upload_violation = self.uploaded_data(x)
-            D_km, data_moving_violation = self.moved_data(D_sm, y_k, y_s)
-            # upload_violation = torch.abs(data_upload_violation.sum())
-            # moving_violation = torch.abs(data_moving_violation.sum())
-
-            t_collect = self.collecting_time(x)
-            t_move = self.moving_time(D_sm, y_k, y_s)
-
-            # Compute the loss
-            loss = t_move
-            total_time = loss
-
-            # Save the trajectory
-            f_trajectory.append([total_time.item(), t_collect.item(), t_move.item()])
-
-            loss.backward()
-            optimizer.step()
-            with torch.no_grad():
-                x.mul_(Psi.unsqueeze(2))  # N x S x M
-            if i % 10000 == 0:
-                print(f'Epoch {i}, Collect: {t_collect.item()}, Move: {t_move.item()}')
-        D_sm, _ = self.uploaded_data(x)
-        D_optimal, _ = self.moved_data(D_sm, y_k, y_s)
-        return f_trajectory, D_optimal, D_sm
+        return f_trajectory, D_optimal, D_sm, int(E.cpu().item()), 2 ** int(math.log2(batch_size.cpu().item()))

@@ -15,6 +15,23 @@ sys.path.append(functions_dir)
 import pickle
 import itertools
 import SPOnGrid as SPG
+from utils.utils import obtain_initial_distribution
+import torch
+import random
+
+def split_number(total, num_parts):
+    """Splits `total` into `num_parts` non-uniformly while summing to `total`, allowing replacement."""
+    # For example, split_number(10, 3) might return something like [3, 4, 3], where 10 data points is split into 3 parts
+    if total == 0:
+        return [0] * num_parts  # If total is 0, return zeros
+
+    # Pick num_parts - 1 cut points, allowing duplicates
+    cuts = np.random.choice(range(total + 1), num_parts - 1, replace=True)
+    cuts.sort()  # Ensure order
+
+    # Compute partitions
+    return [cuts[0]] + [cuts[i] - cuts[i - 1] for i in range(1, num_parts - 1)] + [total - cuts[-1]]
+
 
 def LinkDelay(Lat1, Lon1, Lat2, Lon2, Altittude):
     Lat1 = math.radians(Lat1)
@@ -89,7 +106,7 @@ def Inter_Shell_Graph(OrbitNum1, SatNum1, LatMat1, LatLimit):
     return G, EMap, E
 
 
-def Model_Generator(N, M, D, delta, K):
+def Model_Generator(N, alpha, save_dir):
     # Required Data : Psi, Phi, delta, C_access, C_e, N, S, K
     OrbitNum1 = 72
     SatNum1   = 22
@@ -99,77 +116,103 @@ def Model_Generator(N, M, D, delta, K):
     C_e = 1 # Gbps
     # ========= Load Positions of Satellites  ========================
     fileName = open("/home/svu/e1143336/fedstate/src/StarlinkDataForFL/StarLink_OneShell_1200Slots_Step5s.pkl", "rb")
-    orb_period = 1200
     altitude = 540 # 540 km
-    Lat_list = []
-    Lon_list = []
-    for epoch in range(orb_period):
-        data = pickle.load(fileName)
-        Lat_list.append(data['Lat'])
-        Lon_list.append(data['Lon'])
+
+    # Shuffle before any processing to prevent ordering of the satellites, required since we simply sample the last p satellites as the clients
+    data = pickle.load(fileName)
+    Lat_list = data['Lat']
+    Lon_list = data['Lon']
+
     print(['Data Readout Finished!'])
 
+    # 50 users, 10 regions * 5 countries/region
     PositionUser = [
-        [60.3913, 5.3221],     # Bergen, Norway
-        [-25.2744, 133.7751],  # Australia
-        [-34.6037, -58.3816],  # Buenos Aires, Argentina
-        [35.6895, 139.6917],   # Tokyo, Japan
-        [55.7558, 37.6176],    # Moscow, Russia
-        [51.5074, -0.1278],    # London, UK
-        [48.8566, 2.3522],     # Paris, France
+        # North America
         [40.7128, -74.0060],   # New York, USA
         [34.0522, -118.2437],  # Los Angeles, USA
-        [-23.5505, -46.6333],  # São Paulo, Brazil
-        [-33.8688, 151.2093],  # Sydney, Australia
-        [-1.2921, 36.8219],    # Nairobi, Kenya
-        [30.0444, 31.2357],    # Cairo, Egypt
-        [20.5937, 78.9629],    # India (Central)
-        [56.1304, -106.3468],  # Canada (Central)
-        [35.6762, 139.6503],   # Tokyo (alternate point), Japan
-        [39.9042, 116.4074],   # Beijing, China
-        [-22.9068, -43.1729],  # Rio de Janeiro, Brazil
-        [37.7749, -122.4194],  # San Francisco, USA
-        [52.5200, 13.4050],    # Berlin, Germany
-        [59.3293, 18.0686],    # Stockholm, Sweden
-        [-26.2041, 28.0473],   # Johannesburg, South Africa
-        [31.2304, 121.4737],   # Shanghai, China
-        [35.6895, 139.6917],   # Tokyo (another alternate point), Japan
-        [41.3851, 2.1734],     # Barcelona, Spain
-        [38.7223, -9.1393],    # Lisbon, Portugal
-        [-3.3896, 36.6822],    # Arusha, Tanzania
-        [-15.7942, -47.8822],  # Brasília, Brazil
-        [-20.2008, 57.5074],   # Mauritius
-        [40.4168, -3.7038],    # Madrid, Spain
-        [1.3521, 103.8198],    # Singapore
-        [51.1657, 10.4515],    # Germany (Central)
-        [45.8150, 15.9819],    # Zagreb, Croatia
-        [-13.1631, -72.5450],  # Machu Picchu, Peru
-        [19.8968, -155.5828],  # Hawaii, USA
-        [-33.4489, -70.6693],  # Santiago, Chile
         [45.5017, -73.5673],   # Montreal, Canada
         [49.2827, -123.1207],  # Vancouver, Canada
-        [35.0116, 135.7681],   # Kyoto, Japan
-        [-17.8249, 31.0530],   # Harare, Zimbabwe
-        [43.6532, -79.3832],   # Toronto, Canada
-        [51.0447, -114.0719],  # Calgary, Canada
+        [19.4326, -99.1332],    # Mexico City, Mexico
+        # South America
+        [-23.5505, -46.6333],  # São Paulo, Brazil
+        [-34.6037, -58.3816],  # Buenos Aires, Argentina
         [-12.0464, -77.0428],  # Lima, Peru
-        [48.4284, -123.3656],  # Victoria, Canada
-        [49.8951, -97.1384],   # Winnipeg, Canada
-        [52.1332, -106.6700],   # Saskatoon, Canada
-        [34.3416, 108.9398],   # XI'AN
-        [-37.8136, 144.9631],   # Melbourne, Australia
-        [1.3521, 103.8198],     # Singapore
-        [37.5665, 126.9780]     # Seoul, South Korea (capital city)
+        [-3.1190, -60.0217],  # Manaus, Brazil
+        [-33.4489, -70.6693],  # Santiago, Chile
+        # Western & Northern Europe
+        [51.5074, -0.1278],  # London, UK
+        [52.5200, 13.4050],  # Berlin, Germany
+        [59.3293, 18.0686],  # Stockholm, Sweden
+        [64.1355, -21.8954],  # Reykjavik, Iceland
+        [40.4168, -3.7038],  # Madrid, Spain
+        # Eastern & Southern Europe
+        [55.7558, 37.6176],  # Moscow, Russia
+        [41.9028, 12.4964],  # Rome, Italy
+        [45.8150, 15.9819],  # Zagreb, Croatia
+        [50.0755, 14.4378],  # Prague, Czech Republic
+        [37.9838, 23.7275],  # Athens, Greece
+        # Northern & Western Africa
+        [30.0444, 31.2357],  # Cairo, Egypt
+        [6.5244, 3.3792],  # Lagos, Nigeria
+        [14.6928, -17.4467],  # Dakar, Senegal
+        [36.8065, 10.1815],  # Tunis, Tunisia
+        [5.6037, -0.1870], # Accra
+        # Eastern & Southern Africa
+        [-1.2921, 36.8219],  # Nairobi, Kenya
+        [-26.2041, 28.0473],  # Johannesburg, South Africa
+        [-17.8249, 31.0530],  # Harare, Zimbabwe
+        [-15.3875, 28.3228], # Lusaka, Zambia
+        [-25.9692, 32.5732], # Maputo
+        # Middle East
+        [25.276987, 55.296249],  # Dubai, UAE
+        [35.6892, 51.3890],  # Tehran, Iran
+        [31.7683, 35.2137],  # Jerusalem, Israel
+        [24.7136, 46.6753],  # Riyadh, Saudi Arabia
+        [33.5138, 36.2765],  # Damascus, Syria
+        # East & Southeast Asia
+        [35.6895, 139.6917],  # Tokyo, Japan
+        [31.2304, 121.4737],  # Shanghai, China
+        [37.5665, 126.9780],  # Seoul, South Korea
+        [1.3521, 103.8198],  # Singapore
+        [13.7563, 100.5018],  # Bangkok, Thailand
+        # South & Central Asia
+        [19.0760, 72.8777],  # Mumbai, India
+        [27.7172, 85.3240],  # Kathmandu, Nepal
+        [6.9271, 79.8612],  # Colombo, Sri Lanka
+        [41.3275, 69.2672],  # Tashkent, Uzbekistan
+        [39.9334, 32.8597],  # Ankara, Turkey
+        # Oceania
+        [-33.8688, 151.2093],  # Sydney, Australia
+        [-37.8136, 144.9631],  # Melbourne, Australia
+        [-17.7333, 168.3273],  # Port Vila, Vanuatu
+        [-41.2865, 174.7762],  # Wellington, New Zealand
+        [-20.2008, 57.5074]  # Mauritius
     ]
+    num_regions = 10
+    user_per_region = 5
+    N_per_region = N // num_regions
+    # Select N_per_region for each region
+    PositionUser = [PositionUser[i] for i in range(len(PositionUser)) if i % user_per_region < N_per_region]
+    print("Position of Users selected, should be evenly chosen from each region")
+    print(PositionUser)
 
-    epoch = 0
+    # Initial distribution is non-IID across the 10 regions
+    initial_distribution = obtain_initial_distribution(num_regions, alpha, save_dir) # (num_regions, num_classes)
+    # User distribution is obtained by splitting the dataset in each region
+    user_distribution = [[split_number(x, N_per_region) for x in region] for region in initial_distribution] # (num_regions, num_classes, N_per_region)
+    user_distribution = torch.tensor(user_distribution)
+    user_distribution = torch.flatten(torch.transpose(user_distribution, 2, 1), end_dim=1) # (num_regions * N_per_region, num_classes)
+    print("Initial distribution that is generated non-IID across the 10 regions")
+    print(initial_distribution)
+    print("Dividing the data from each region to each user in that region")
+    print(user_distribution)
 
     S_n = [[] for n in range(N)]
     S_set = set()
     for n, s in itertools.product(range(N), range(OrbitNum1*SatNum1)):
         [Lat1, Lon1] = PositionUser[n]
-        Lat2 = Lat_list[epoch][s]
-        Lon2 = Lon_list[epoch][s]
+        Lat2 = Lat_list[s]
+        Lon2 = Lon_list[s]
         if LinkDelay(Lat1, Lon1, Lat2, Lon2, altitude) < 928:
             S_n[n].append(s)
             S_set.add(s)
@@ -181,19 +224,6 @@ def Model_Generator(N, M, D, delta, K):
         for s in s_set:
             Psi[n][S_set.index(s)] = 1
 
-    if K > S or K > N:
-        print("Invalid Input!!!!!")
-        return False
-    else:
-        # Select K client's from near the K largest dataset
-        D_rows = np.sum(D,1)
-        indices = np.argpartition(D_rows, -K)[-K:]  # Get the indices of the top K elements
-        # Sort these indices based on the actual values in descending order
-        sorted_indices = indices[np.argsort(-D_rows[indices])]
-
-    Client_Set = []
-    for i1 in sorted_indices:
-        Client_Set.append(S_set.index(S_n[i1][0]))
     # ================== Generate Connectivity ==========================
     G, EMap, E = Inter_Shell_Graph(OrbitNum1, SatNum1, LatMat1, LatLimit)
 
@@ -208,10 +238,6 @@ def Model_Generator(N, M, D, delta, K):
             # if edge_index not in E_involved:
             #     E_involved.append(edge_index)
     E_involved = [x for x in range(len(E))]
-
-
-
-    file_write = open("/home/svu/e1143336/fedstate/src/StarlinkDataForFL/SatelliteRelatedData.pkl", "wb")
     data = {'Psi':Psi,
             'Phi':Phi,
             'C_access':C_access,
@@ -219,9 +245,6 @@ def Model_Generator(N, M, D, delta, K):
             'N':N,
             'S':S,
             'S_set':S_set,
-            'K':K,
             'E_involved':E_involved,
-            'Client_Set':Client_Set}
-    pickle.dump(data, file_write)
-    # print(data)
-    return data
+            'G': (G != 999).astype(int)}
+    return data, user_distribution
